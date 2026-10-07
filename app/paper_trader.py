@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+from app.config import ACCOUNT_BALANCE, MAX_DAILY_LOSS, MAX_DRAWDOWN
+from app.risk_manager import RiskManager
+
+
+class PaperTrader:
+    def __init__(self, balance: float = ACCOUNT_BALANCE):
+        self.balance = balance
+        self.starting_balance = balance
+        self.risk_manager = RiskManager(balance)
+        self.position_side = None
+        self.position_qty = 0.0
+        self.entry_price = 0.0
+        self.total_pnl = 0.0
+        self.closed_trades = []
+        self.equity_curve = []
+        self.max_drawdown = 0.0
+        self.daily_realized_pnl = 0.0
+        self.latest_timestamp = None
+
+    def update_equity(self, timestamp=None) -> None:
+        self.latest_timestamp = timestamp
+        self.equity_curve.append({
+            "timestamp": timestamp,
+            "equity": self.balance,
+            "pnl": self.total_pnl,
+        })
+
+        peak = max(item["equity"] for item in self.equity_curve) if self.equity_curve else self.balance
+        current = self.balance
+        drawdown = (peak - current) / peak if peak > 0 else 0.0
+        self.max_drawdown = max(self.max_drawdown, drawdown)
+
+    def open_position(self, price: float, signal: int, timestamp=None) -> None:
+        if self.position_side is not None:
+            return
+
+        side = "long" if signal > 0 else "short"
+        qty = self.risk_manager.position_size(price, side)
+        if qty <= 0:
+            return
+
+        self.position_side = side
+        self.position_qty = qty
+        self.entry_price = price
+        self.update_equity(timestamp)
+
+    def close_position(self, price: float, reason: str = "manual", timestamp=None) -> None:
+        if self.position_side is None:
+            return
+
+        if self.position_side == "long":
+            pnl = (price - self.entry_price) * self.position_qty
+        else:
+            pnl = (self.entry_price - price) * self.position_qty
+
+        self.balance += pnl
+        self.total_pnl += pnl
+        self.daily_realized_pnl += pnl
+
+        trade = {
+            "side": self.position_side,
+            "entry_price": self.entry_price,
+            "exit_price": price,
+            "qty": self.position_qty,
+            "pnl": pnl,
+            "reason": reason,
+            "timestamp": timestamp,
+        }
+        self.closed_trades.append(trade)
+
+        self.position_side = None
+        self.position_qty = 0.0
+        self.entry_price = 0.0
+        self.update_equity(timestamp)
+
+    def check_stop_loss(self, low: float, high: float, timestamp=None) -> bool:
+        if self.position_side is None:
+            return False
+
+        if self.position_side == "long":
+            stop_loss = self.risk_manager.stop_loss_price(self.entry_price, "long")
+            if low <= stop_loss:
+                self.close_position(stop_loss, "stop_loss", timestamp)
+                return True
+        else:
+            stop_loss = self.risk_manager.stop_loss_price(self.entry_price, "short")
+            if high >= stop_loss:
+                self.close_position(stop_loss, "stop_loss", timestamp)
+                return True
+
+        return False
+
+    def check_take_profit(self, low: float, high: float, timestamp=None) -> bool:
+        if self.position_side is None:
+            return False
+
+        if self.position_side == "long":
+            take_profit = self.risk_manager.take_profit_price(self.entry_price, "long")
+            if high >= take_profit:
+                self.close_position(take_profit, "take_profit", timestamp)
+                return True
+        else:
+            take_profit = self.risk_manager.take_profit_price(self.entry_price, "short")
+            if low <= take_profit:
+                self.close_position(take_profit, "take_profit", timestamp)
+                return True
+
+        return False
+
+    def check_daily_loss_limit(self) -> bool:
+        if self.starting_balance <= 0:
+            return False
+        daily_loss_pct = abs(self.daily_realized_pnl) / self.starting_balance
+        return daily_loss_pct >= MAX_DAILY_LOSS
+
+    def check_drawdown_limit(self) -> bool:
+        peak = max(item["equity"] for item in self.equity_curve) if self.equity_curve else self.balance
+        current = self.balance
+        drawdown = (peak - current) / peak if peak > 0 else 0.0
+        return drawdown >= MAX_DRAWDOWN
